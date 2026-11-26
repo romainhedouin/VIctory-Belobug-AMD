@@ -268,6 +268,20 @@ impl Held<'_> {
         self.write[at].note(page, parts, now)
     }
 
+    /// The notes of pages `[first, last)` in page order, `each` of them
+    /// until it says no: whether it never did; their parts held.
+    fn each(&self, first: usize, last: usize, mut each: impl FnMut(usize, u64) -> bool) -> bool {
+        match pieces(first, last) {
+            Some(pieces) => pieces.into_iter().all(|(from, to)| {
+                self.shard(from)
+                    .written
+                    .range(from..to)
+                    .all(|(&p, &w)| each(p, w))
+            }),
+            None => self.range(first, last).into_iter().all(|(p, w)| each(p, w)),
+        }
+    }
+
     /// The notes of pages `[first, last)` in page order; their parts held.
     fn range(&self, first: usize, last: usize) -> Vec<(usize, u64)> {
         match pieces(first, last) {
@@ -1249,20 +1263,50 @@ pub(crate) fn asked(start: usize, end: usize) -> Option<(u64, Vec<(usize, u64)>)
 /// kernel just reported. `None` if the memory is not write-watched (nor,
 /// with `guarded`, view memory, which is then guarded).
 pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Vec<(usize, u64)>)> {
+    let mut written = Vec::new();
+    let (now, _) = asking(start, end, guarded, |page, at| {
+        written.push((page, at));
+        true
+    })?;
+    Some((now, written))
+}
+
+/// [`writes`] for a caller that only wants to know whether a page of the
+/// range was last written by an asking after `since`: no list is made, and
+/// the look stops at the first such page.
+pub(crate) fn written_since(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    since: u64,
+) -> Option<(u64, bool)> {
+    let (now, none) = asking(start, end, guarded, |_, at| at <= since)?;
+    Some((now, !none))
+}
+
+/// The asking behind [`writes`]: this asking's number, and the notes of the
+/// range's pages given to `look` in page order, under the locks they are
+/// read under, until it says no: whether it never did.
+fn asking<F: FnMut(usize, u64) -> bool>(
+    start: usize,
+    end: usize,
+    guarded: bool,
+    mut look: F,
+) -> Option<(u64, bool)> {
     let (first, last) = (start / PAGE, end.div_ceil(PAGE));
     // Asked ahead with the submission's other ranges: the journal has it.
     // (The standing number changes only with the journal held alone, so its
     // notes are all in: a part at a time will do.)
-    let ahead = |j: &Journal| j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.range(first, last)));
+    let ahead = |j: &Journal, look: &mut F| j.ahead.holds(first, last).then(|| (j.ahead_asked, j.notes.each(first, last, look)));
     // A fresh number and the notes of the range, its parts held meanwhile
     // (renderer port #7, switch or not: who notes shared takes its number
     // holding the parts it notes in).
-    let fresh = || {
+    let fresh = |look: &mut F| {
         let j = journal();
         let held = j.notes.hold(shards_of(first, last), false);
-        (next_asking(), held.range(first, last))
+        (next_asking(), held.each(first, last, look))
     };
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&journal(), &mut look) {
         return Some(known);
     }
     // Read-only since an asking noted it: the bits first, then the journal.
@@ -1272,7 +1316,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             tally(2, 1);
             crate::faultbook::note(crate::faultbook::What::Known, first, last, 0);
         }
-        return Some(fresh());
+        return Some(fresh(&mut look));
     }
     // Renderer port #6: view memory, which the kernel would refuse, and the
     // caller does not ask the guards (textures, which then guard by a way of
@@ -1283,7 +1327,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     // Asked, and the answer noted, with the range held: nothing else asks
     // about any of it in between.
     let _range = Asking::hold(first, last);
-    if let Some(known) = ahead(&journal()) {
+    if let Some(known) = ahead(&journal(), &mut look) {
         return Some(known);
     }
     let mut guards_asked = false;
@@ -1330,7 +1374,7 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
     };
     if pages.is_empty() {
         // Nothing to note: the others may go on reading.
-        return Some(fresh());
+        return Some(fresh(&mut look));
     }
     let answer = if port_journal() {
         // Renderer port #7: shared, the range's parts held for writing (the
@@ -1342,14 +1386,14 @@ pub(crate) fn writes(start: usize, end: usize, guarded: bool) -> Option<(u64, Ve
             held.note(page, parts, now);
         }
         port7_count(P7_SHARED_NOTES, 1);
-        (now, held.range(first, last))
+        (now, held.each(first, last, &mut look))
     } else {
         let mut j = journal_mut();
         let now = next_asking();
         for &(page, parts) in &pages {
             j.notes.note(page, parts, now);
         }
-        (now, j.notes.range(first, last))
+        (now, j.notes.each(first, last, &mut look))
     };
     // Noted: what the guards made clean of it is known by its bits from
     // now on. (The range is still held: no other asking of any of it came
@@ -3987,6 +4031,11 @@ mod tests {
         let (later, again) = writes(p + PAGE, p + 2 * PAGE, false).expect("watched");
         assert!(later > now);
         assert_eq!(new(again), [(p / PAGE + 1, now)]);
+        // The same answer without the list: newer than the asking before it, not than it.
+        let (_, newer) = written_since(start, end, false, now - 1).expect("watched");
+        assert!(newer);
+        let (_, newer) = written_since(start, end, false, now).expect("watched");
+        assert!(!newer);
         let mut plain = vec![0u8; PAGE];
         assert!(
             writes(

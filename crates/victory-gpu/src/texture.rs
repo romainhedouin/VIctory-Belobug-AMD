@@ -1242,8 +1242,8 @@ impl Staging {
         if alone && last.hash.is_some() {
             return 0;
         }
-        if !alone && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, false)) {
-            if last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked) {
+        if !alone && let Some((now, newer)) = waited(1, || crate::watch::written_since(start, start + size, false, last.asked)) {
+            if last.asked != 0 && !newer {
                 return 0;
             }
             last.asked = now;
@@ -1272,10 +1272,10 @@ impl Staging {
         let mut blind = false;
         if !alone
             && *GUARD.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_GUARD").is_none_or(|v| v != "0"))
-            && let Some((now, written)) = waited(1, || crate::watch::writes(start, start + size, true))
+            && let Some((now, newer)) = waited(1, || crate::watch::written_since(start, start + size, true, last.asked))
         {
             const HASH_EVERY: u64 = 8;
-            let unwritten = last.asked != 0 && written.iter().all(|&(_, w)| w <= last.asked);
+            let unwritten = last.asked != 0 && !newer;
             last.asked = now;
             let frame = crate::frame::current();
             let turn = frame
