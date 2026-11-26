@@ -4018,6 +4018,7 @@ impl State {
             _ => false,
         };
         if !matches_kind {
+            #[cfg(feature = "diagnostics")]
             why(&format!(
                 "pipeline mismatch (compute {}, mesh {}, topology {})",
                 p.compute, p.mesh, self.topology
