@@ -83,12 +83,15 @@ pub enum Exit {
 }
 
 impl Exit {
-    pub fn successors(&self) -> Vec<usize> {
-        match *self {
-            Exit::Jump(b) => vec![b],
-            Exit::Branch { taken, not_taken } => vec![taken, not_taken],
-            Exit::End | Exit::Indirect => vec![],
-        }
+    /// The taken edge first. The passes over the graph ask at every step, so
+    /// this neither allocates nor borrows the exit.
+    pub fn successors(&self) -> impl Iterator<Item = usize> + use<> {
+        let (first, second) = match *self {
+            Exit::Jump(b) => (Some(b), None),
+            Exit::Branch { taken, not_taken } => (Some(taken), Some(not_taken)),
+            Exit::End | Exit::Indirect => (None, None),
+        };
+        first.into_iter().chain(second)
     }
 }
 
@@ -1041,8 +1044,8 @@ pub(crate) fn reverse_postorder(blocks: &[Block]) -> Vec<usize> {
     while let Some(top) = stack.last_mut() {
         let (b, i) = *top;
         top.1 += 1;
-        match blocks[b].exit.successors().get(i) {
-            Some(&s) if !seen[s] => {
+        match blocks[b].exit.successors().nth(i) {
+            Some(s) if !seen[s] => {
                 seen[s] = true;
                 stack.push((s, 0));
             }
@@ -1218,8 +1221,8 @@ fn multi_entry_loop(blocks: &[Block], inside: &[bool]) -> Option<(Vec<bool>, Vec
         let mut seen = vec![false; blocks.len()];
         let mut stack = vec![from];
         while let Some(b) = stack.pop() {
-            let next = if forward {
-                blocks[b].exit.successors()
+            let next: Vec<usize> = if forward {
+                blocks[b].exit.successors().collect()
             } else {
                 blocks[b].preds.clone()
             };
@@ -1676,10 +1679,10 @@ fn effects(
     if vector {
         r.extend(mask(EXEC));
     }
-    let mut seen = Vec::with_capacity(r.len());
-    r.retain(|reg| {
-        let new = !seen.contains(reg);
-        seen.push(*reg);
+    let mut seen = [0; REGS.div_ceil(64)];
+    r.retain(|&reg| {
+        let new = !contains(&seen, reg);
+        insert(&mut seen, reg);
         new
     });
     Ok(Some((r, w)))
@@ -1904,6 +1907,19 @@ mod tests {
         assert_eq!(bitset.read(Reg::S(13)), Some(input(&p, Reg::S(13))));
         assert_eq!(addk.read(Reg::S(14)), Some(input(&p, Reg::S(14))));
         assert_eq!(mov.read(Reg::S(15)), None);
+    }
+
+    #[test]
+    fn a_register_read_twice_is_listed_once_in_first_use_order() {
+        let p = build_words(
+            &[
+                0x4A00_0301, // v_add_nc_u32 v0, v1, v1
+                S_ENDPGM,
+            ],
+            false,
+        );
+        let regs: Vec<Reg> = p.blocks[0].insts[0].reads.iter().map(|r| r.0).collect();
+        assert_eq!(regs, [Reg::V(1), Reg::S(EXEC), Reg::V(0)]);
     }
 
     #[test]
