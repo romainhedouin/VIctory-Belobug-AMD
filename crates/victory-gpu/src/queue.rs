@@ -712,8 +712,8 @@ fn overlay_resource(parameters: *const Plane) -> Option<This> {
 extern "system" fn execute_x(this: This, count: u32, lists: *const This, _token: u64, _flags: u32) {
     execute(this, count, lists);
 }
-/// Signal with sync settings for the top and bottom of the pipe; our
-/// submissions are complete when they return, so it signals at once.
+/// Signal with sync settings for the top and bottom of the pipe, which are
+/// not used: it is [`signal`], which runs once the queue's work before it has.
 extern "system" fn signal2_x(
     this: This,
     fence: This,

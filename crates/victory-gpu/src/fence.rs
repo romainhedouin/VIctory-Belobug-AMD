@@ -1,5 +1,6 @@
-//! Fences: a 64-bit value and the events waiting for it. Nothing runs on a
-//! GPU yet, so only signals (the title's, later our queues') move one.
+//! Fences: a 64-bit value and the events waiting for it. Signals (the
+//! title's, our queues') move one, and so can the bottom-of-pipe writes of
+//! the lists the host GPU ran, when they land in the value's memory.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::ffi::c_void;

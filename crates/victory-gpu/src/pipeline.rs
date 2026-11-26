@@ -9,9 +9,10 @@
 //! containers are shared by content hash and translated once, on first
 //! use (decision 0003).
 //!
-//! shortcut: only vertex plus pixel pipelines from streams and compute
-//! pipelines get host pipelines; mesh, tessellation and geometry stages,
-//! and the plain graphics description, keep their containers only. The 32-byte
+//! shortcut: only vertex or mesh plus pixel pipelines from streams (mesh ones
+//! where the host has mesh shaders) and compute pipelines get host
+//! pipelines; tessellation and geometry stages, and the plain graphics
+//! description, keep their containers only. The 32-byte
 //! packet after the header stays zero: titles only copy it inline, which
 //! our null command-list limits keep from running.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]

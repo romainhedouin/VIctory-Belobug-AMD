@@ -534,8 +534,9 @@ struct Scheduler {
     finished: Condvar,
 }
 
-/// Priority weights per class (low, normal, high and real-time), as the
-/// console's: about 10x per level, counted against request sizes.
+/// Priority weights per class (low, normal and high; real-time counts as
+/// high), as the console's: about 10x per level, counted against request
+/// sizes.
 const COST: [u64; 3] = [100, 10, 1];
 /// The console's default staging buffer.
 const STAGING: u64 = 32 << 20;

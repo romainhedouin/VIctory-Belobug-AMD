@@ -9,7 +9,7 @@
 //!
 //! The frame decoder follows FFmpeg's `wmaprodec.c` (LGPL-2.1-or-later, used
 //! under GPL-3.0-or-later) restricted to what XMA needs: at most two
-//! channels, four subframe sizes (512 down to 128), no LFE channel.
+//! channels, three subframe sizes (512, 256 and 128), no LFE channel.
 
 mod tables;
 
@@ -720,7 +720,7 @@ impl Decoder {
         if offset == FRAME_SAMPLES - MIN_SUBFRAME {
             return Ok(MIN_SUBFRAME);
         }
-        // Four subframe sizes: a 1-bit "not maximal", then 1 bit of shift.
+        // Three subframe sizes: a 1-bit "not maximal", then 1 bit of shift.
         let shift = if b.bit() { 1 + b.read(1) } else { 0 };
         let len = FRAME_SAMPLES >> shift;
         if len < MIN_SUBFRAME {

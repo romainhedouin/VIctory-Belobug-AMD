@@ -1,6 +1,8 @@
 //! What every console graphics object starts with: a function table
 //! pointer, bookkeeping bits and a reference count. Tables begin with
-//! IUnknown's three slots. Our objects are static and never destroyed.
+//! IUnknown's three slots. Some of our objects are static and never
+//! destroyed; the others are boxed by `hand_out`, and the last release frees
+//! them.
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
 use std::collections::BTreeMap;

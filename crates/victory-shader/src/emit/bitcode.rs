@@ -517,7 +517,6 @@ impl Module {
         self.named.push((name.into(), nodes));
     }
 
-    /// The module as bitcode.
     /// Which instructions are written: every body instruction, the branch
     /// conditions, and whatever they read, transitively (a phi nothing reads
     /// is dropped). A worklist visits each instruction once, so a long chain
@@ -549,6 +548,7 @@ impl Module {
         live
     }
 
+    /// The module as bitcode.
     pub fn write(&self) -> Vec<u8> {
         let mut w = Writer::default();
         w.bytes(b"BC\xC0\xDE");

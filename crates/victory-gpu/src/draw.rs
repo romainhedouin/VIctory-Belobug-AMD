@@ -556,7 +556,7 @@ pub(crate) fn dropped_now() -> u64 {
 }
 
 /// Draws, mesh dispatches and dispatches recorded but not run on the host
-/// (no host pipeline) since the last call.
+/// (no host pipeline, or state it could not bind) since the last call.
 pub(crate) fn take_dropped() -> u64 {
     DROPPED.swap(0, Ordering::Relaxed)
 }
@@ -1530,8 +1530,6 @@ impl State {
         true
     }
 
-    /// A descriptor a shader reads through a table: its host slot made if
-    /// it changed, constant data copied, textures made readable.
     /// What draws and dispatches share: heaps, our root signature, the
     /// pipeline, and per stage the user data, root views and the
     /// descriptors its tables hold.
@@ -3377,6 +3375,8 @@ impl State {
         }
     }
 
+    /// A descriptor a shader reads through a table: its host slot made if
+    /// it changed, constant data copied, textures made readable.
     fn table_entry(&self, list: &HostList, u: &UsedResource, compute: bool) {
         let Some(Root::Table(table)) = self.roots_ref(compute).get(usize::from(u.slot)) else {
             return;
