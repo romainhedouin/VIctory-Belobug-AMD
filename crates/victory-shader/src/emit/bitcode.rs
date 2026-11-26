@@ -6,6 +6,9 @@
 //! instructions of `main` in block order.
 
 use std::collections::HashMap;
+use std::hash::{BuildHasherDefault, Hasher};
+
+use crate::structure::Fx;
 
 pub mod census;
 pub mod opt;
@@ -211,12 +214,45 @@ enum MdDef {
     Node(Vec<Option<Md>>),
 }
 
+/// [`Fx`] with its high bits rotated down into the low ones, which pick the
+/// bucket: floats such as 1.0 and 3.0 differ only in their high bits, and
+/// would all start at one bucket. The tables it keys are only probed, never
+/// walked (ids follow insertion order), so it cannot change what is written.
+#[derive(Default)]
+struct Interned(Fx);
+
+impl Hasher for Interned {
+    fn finish(&self) -> u64 {
+        self.0.finish().rotate_left(26)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        self.0.write(bytes);
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0.write_u32(n);
+    }
+
+    fn write_u64(&mut self, n: u64) {
+        self.0.write_u64(n);
+    }
+
+    fn write_usize(&mut self, n: usize) {
+        self.0.write_usize(n);
+    }
+}
+
+/// Every `i32()`, `cmp()` and `dx.op` call looks up one of these, so the hash
+/// has to be cheap.
+type Ids<K> = HashMap<K, u32, BuildHasherDefault<Interned>>;
+
 #[derive(Default)]
 pub(crate) struct Module {
     types: Vec<TypeDef>,
-    type_ids: HashMap<TypeDef, u32>,
+    type_ids: Ids<TypeDef>,
     consts: Vec<(Ty, Const)>,
-    const_ids: HashMap<(Ty, Const), u32>,
+    const_ids: Ids<(Ty, Const)>,
     globals: Vec<Global>,
     funcs: Vec<Func>,
     func_ids: HashMap<String, u32>,
@@ -1166,6 +1202,26 @@ mod tests {
             let live = m.live();
             assert_eq!(live, live_by_passes(&m), "{regs} regs x {stages} stages");
         }
+    }
+
+    /// Ids are the insertion order, whatever the hasher does with the keys:
+    /// words with only high bits set (1.0, 3.0, ...) are the hard case.
+    #[test]
+    fn interned_ids_follow_insertion_order() {
+        let mut m = Module::default();
+        let f32t = m.float();
+        let i32t = m.int(32);
+        let floats: Vec<V> = (0..2048u32).map(|k| m.f32(k << 16)).collect();
+        let ints: Vec<V> = (0..2048u32).map(|k| m.i32(k << 20)).collect();
+        for (k, &v) in floats.iter().chain(&ints).enumerate() {
+            assert_eq!(v, V::Const(k as u32));
+        }
+        for k in 0..2048u32 {
+            assert_eq!(m.f32(k << 16), floats[k as usize]);
+            assert_eq!(m.i32(k << 20), ints[k as usize]);
+        }
+        assert_eq!((f32t, i32t), (m.float(), m.int(32)));
+        assert_eq!(m.consts.len(), 4096);
     }
 
     #[test]
