@@ -19,6 +19,7 @@
 use std::alloc::Layout;
 use std::collections::{BTreeMap, VecDeque};
 use std::ffi::c_void;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock, RwLock, RwLockReadGuard};
 use std::time::Instant;
 
@@ -274,6 +275,7 @@ pub extern "system" fn AcpHalAllocateShapeContexts(contexts: *mut ShapeContexts)
     let mut xma = XMA.write().unwrap_or_else(|e| e.into_inner());
     xma.array = arrays[4] as usize;
     xma.voices = (0..counts[4]).map(|_| Mutex::new(None)).collect();
+    xma.enabled = (0..counts[4]).map(|_| AtomicBool::new(false)).collect();
     S_OK
 }
 
@@ -357,12 +359,16 @@ struct Xma {
     /// so a command for one voice never waits for others to decode (the
     /// title sends them from its time-critical mixer thread).
     voices: Vec<Mutex<Option<Voice>>>,
+    /// Whether each voice is `Some`, so a pass need not lock the idle ones.
+    /// Changed only with the voice's lock held.
+    enabled: Vec<AtomicBool>,
 }
 
 impl Xma {
     const EMPTY: Xma = Xma {
         array: 0,
         voices: Vec::new(),
+        enabled: Vec::new(),
     };
 }
 
@@ -439,6 +445,7 @@ impl Xma {
                 ended_ms: None,
             },
         });
+        self.enabled[index as usize].store(true, Ordering::Release);
         drop(slot);
         wake_decoder();
     }
@@ -447,9 +454,12 @@ impl Xma {
         let Some(context) = self.context(index) else {
             return;
         };
-        let Some(voice) = lock(&self.voices[index as usize]).take() else {
+        let mut slot = lock(&self.voices[index as usize]);
+        self.enabled[index as usize].store(false, Ordering::Release);
+        let Some(voice) = slot.take() else {
             return;
         };
+        drop(slot);
         let t = &voice.trace;
         tracing::debug!(
             index,
@@ -492,14 +502,19 @@ impl Xma {
         wake_decoder();
     }
 
-    /// Fills every enabled context's output as far as it has room.
-    fn pump(&self) {
+    /// Fills every enabled context's output as far as it has room, and
+    /// returns how many there were.
+    fn pump(&self) -> usize {
         let start = Instant::now();
         let mut active = 0;
         for index in 0..self.voices.len() as u32 {
-            if let (Some(context), Some(voice)) =
-                (self.context(index), &mut *lock(&self.voices[index as usize]))
-            {
+            if !self.enabled[index as usize].load(Ordering::Acquire) {
+                continue;
+            }
+            if let (Some(context), Some(voice)) = (
+                self.context(index),
+                &mut *lock(&self.voices[index as usize]),
+            ) {
                 pump(context, voice);
                 active += 1;
             }
@@ -508,6 +523,7 @@ impl Xma {
         if took.as_millis() >= 4 {
             tracing::debug!(active, ms = took.as_millis(), "slow XMA decoding pass");
         }
+        active
     }
 }
 
@@ -705,9 +721,14 @@ fn wake_decoder() {
                 .name("victory XMA decoder".into())
                 .spawn(|| {
                     loop {
-                        xma().pump();
-                        // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
-                        std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        let active = xma().pump();
+                        if active == 0 {
+                            // Enabling a voice wakes the thread.
+                            std::thread::park();
+                        } else {
+                            // A 256-byte output block lasts 2.7 ms at 48 kHz mono.
+                            std::thread::park_timeout(std::time::Duration::from_millis(2));
+                        }
                     }
                 })
                 .map_or_else(|_| std::thread::current(), |h| h.thread().clone())
