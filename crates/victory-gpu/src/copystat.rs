@@ -16,12 +16,8 @@ pub(crate) enum C {
     CopyBytes,
     Refreshes,
     RefreshBytes,
-    Skipped,
-    SkippedBytes,
     Runs,
     RunUs,
-    Queries,
-    QueryUs,
     MoveUs,
     Unmapped,
     /// Write-watch askings and their time.
@@ -132,7 +128,7 @@ pub(crate) enum C {
     WaitsForBuffers,
     IndirectBounded,
 }
-const COUNTERS: usize = 80;
+const COUNTERS: usize = 76;
 /// One of some sets of counters, each in lines of the processor's memory of
 /// its own: a set for all threads had them wait for each other's lines at
 /// every list call (what counts here is summed up for the log alone).
@@ -1271,21 +1267,17 @@ pub(crate) fn log(frames: f64) {
     let ms = |v: f64| v / 1e3;
     tracing::info!(
         "copies per frame: {:.1} submissions; {:.0} title copies {:.1} MB; {:.0} refreshes {:.1} MB, \
-         {:.0} skipped {:.1} MB; {:.0} runs {:.1} ms; {:.0} queries {:.2} ms, moves {:.2} ms, \
-         {:.2} MB unmapped; {:.0} page faults; {:.0} watches {:.2} ms, {:.1} MB checked, {:.1} MB \
-         unchanged; {:.1} fallbacks; {:.0} guard faults; textures {:.1} MB watched and \
-         changed, {:.1} MB hashed, {:.1} MB of them changed, {:.1} changes the guard did not see",
+         {:.0} runs {:.1} ms; moves {:.2} ms, {:.2} MB unmapped; {:.0} page faults; {:.0} watches \
+         {:.2} ms, {:.1} MB checked, {:.1} MB unchanged; {:.1} fallbacks; {:.0} guard faults; \
+         textures {:.1} MB watched and changed, {:.1} MB hashed, {:.1} MB of them changed, \
+         {:.1} changes the guard did not see",
         c[C::Submissions as usize],
         c[C::Copies as usize],
         mb(c[C::CopyBytes as usize]),
         c[C::Refreshes as usize],
         mb(c[C::RefreshBytes as usize]),
-        c[C::Skipped as usize],
-        mb(c[C::SkippedBytes as usize]),
         c[C::Runs as usize],
         ms(c[C::RunUs as usize]),
-        c[C::Queries as usize],
-        ms(c[C::QueryUs as usize]),
         ms(c[C::MoveUs as usize]),
         mb(c[C::Unmapped as usize]),
         faults as f64 / frames,
