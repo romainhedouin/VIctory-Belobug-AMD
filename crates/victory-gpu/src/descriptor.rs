@@ -132,32 +132,60 @@ const SHADER_VISIBLE: u32 = 1;
 static SHADER_HEAPS: std::sync::RwLock<Vec<(u64, u64, usize)>> = std::sync::RwLock::new(Vec::new());
 
 /// Makes the host descriptor for what the title wrote at `handle`, if it
-/// is in a shader-visible heap. Keeps `SHADER_HEAPS` locked for the duration
-/// so `Heap::drop` cannot free the heap concurrently.
+/// is in a shader-visible heap.
 #[cfg(windows)]
 fn mirror(handle: u64) {
+    mirror_range(handle, 1, 1);
+}
+
+/// Makes the host descriptors for what the title wrote at the `count`
+/// slots `step` bytes apart from `handle`, finding the heap once for each
+/// run of them in one heap. Keeps `SHADER_HEAPS` locked for the duration
+/// so `Heap::drop` cannot free the heap concurrently.
+#[cfg(windows)]
+fn mirror_range(handle: u64, count: u32, step: u64) {
     let heaps = SHADER_HEAPS.read().unwrap_or_else(|e| e.into_inner());
-    let Some(&(_, _, at)) = heaps
-        .iter()
-        .find(|&&(start, end, _)| (start..end).contains(&handle))
-    else {
-        return;
-    };
-    // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
-    // the `SHADER_HEAPS` lock we hold here.
-    let heap = unsafe { &*(at as *const Heap) };
-    let Some(index) = heap.index(handle) else {
-        return;
-    };
-    // Renderer port #2: its record is looked at again with the title's own.
-    crate::port_descriptors::mark(handle);
-    let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
-    match heap.host.get() {
-        None => pending.push(index),
-        Some(host) => {
-            drop(pending);
-            if let Some(host) = host {
-                host.mirror(index, handle, false);
+    let mut done = 0;
+    while done < count {
+        let at = handle + u64::from(done) * step;
+        // The first heap that holds `at` is also the first to hold every
+        // slot up to its end, unless another heap starts sooner: the run
+        // stops there, as when each slot is looked up alone.
+        let mut found = None;
+        let mut next = u64::MAX;
+        for &(start, end, heap) in heaps.iter() {
+            if (start..end).contains(&at) {
+                found.get_or_insert((end, heap));
+            } else if start > at {
+                next = next.min(start);
+            }
+        }
+        let end = found.map_or(next, |(end, _)| end.min(next));
+        let n = (end - at).div_ceil(step).min(u64::from(count - done)) as u32;
+        done += n;
+        let Some((_, heap)) = found else {
+            continue;
+        };
+        // SAFETY: registered heaps stay alive until `Heap::drop`, which takes
+        // the `SHADER_HEAPS` lock we hold here.
+        let heap = unsafe { &*(heap as *const Heap) };
+        let slots = (0..u64::from(n)).filter_map(|k| {
+            let slot = at + k * step;
+            let index = heap.index(slot)?;
+            // Renderer port #2: its record is looked at again with the title's own.
+            crate::port_descriptors::mark(slot);
+            Some((index, slot))
+        });
+        let mut pending = heap.pending.lock().unwrap_or_else(|e| e.into_inner());
+        match heap.host.get() {
+            None => pending.extend(slots.map(|(index, _)| index)),
+            Some(host) => {
+                drop(pending);
+                if let Some(host) = host {
+                    for (index, slot) in slots {
+                        host.mirror(index, slot, false);
+                    }
+                }
             }
         }
     }
@@ -1624,9 +1652,7 @@ pub(crate) extern "system" fn copy_simple(_: This, count: u32, dst: u64, src: u6
             std::ptr::copy(src as *const u8, dst as *mut u8, len as usize)
         };
         #[cfg(windows)]
-        for i in 0..u64::from(count) {
-            mirror(dst + i * step);
-        }
+        mirror_range(dst, count, step);
     }
 }
 
@@ -1648,24 +1674,22 @@ pub(crate) extern "system" fn copy(
     };
     // Each range as (start, count); a null size array means one descriptor
     // per range.
-    let ranges = |n: u32, starts: *const u64, sizes: *const u32| -> Vec<(u64, u32)> {
-        (0..n as usize)
-            .map(|i| {
-                // SAFETY: the title passes `n` starts and sizes (or null sizes).
-                unsafe {
-                    (
-                        *starts.add(i),
-                        if sizes.is_null() { 1 } else { *sizes.add(i) },
-                    )
-                }
-            })
-            .collect()
+    let ranges = |n: u32, starts: *const u64, sizes: *const u32| {
+        (0..n as usize).map(move |i| {
+            // SAFETY: the title passes `n` starts and sizes (or null sizes).
+            unsafe {
+                (
+                    *starts.add(i),
+                    if sizes.is_null() { 1 } else { *sizes.add(i) },
+                )
+            }
+        })
     };
     if dst_starts.is_null() || src_starts.is_null() {
         return;
     }
     let src = ranges(src_ranges, src_starts, src_sizes);
-    let mut dst = ranges(dst_ranges, dst_starts, dst_sizes).into_iter();
+    let mut dst = ranges(dst_ranges, dst_starts, dst_sizes);
     let (mut to, mut room) = dst.next().unwrap_or((0, 0));
     for (mut from, mut left) in src {
         while left > 0 {
