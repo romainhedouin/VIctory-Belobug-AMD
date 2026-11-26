@@ -69,7 +69,9 @@ fn offline(block: *mut AsyncBlock, what: &str) -> HRESULT {
     tracing::info!(what, "store call: offline");
     xasync::finished(block, (&raw const FAILED).cast(), NETWORK_ERROR)
 }
-/// The result functions of calls that failed: their status.
+/// The result functions of calls that failed: their status. Titles pass an
+/// output after the block (a pointer, or a size and a buffer); the Win64
+/// convention lets this ignore them, so one function serves every shape.
 extern "system" fn status(_: This, block: *mut AsyncBlock) -> HRESULT {
     xasync::XAsyncGetStatus(block, false)
 }
@@ -234,28 +236,6 @@ extern "system" fn user_id_async(
 ) -> HRESULT {
     offline(block, "user store id")
 }
-extern "system" fn size_status(_: This, block: *mut AsyncBlock, _out: *mut usize) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
-}
-extern "system" fn string_status(
-    _: This,
-    block: *mut AsyncBlock,
-    _: usize,
-    _: *mut c_char,
-) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
-}
-extern "system" fn count_status(_: This, block: *mut AsyncBlock, _out: *mut u32) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
-}
-extern "system" fn array_status(
-    _: This,
-    block: *mut AsyncBlock,
-    _: u32,
-    _: *mut c_void,
-) -> HRESULT {
-    xasync::XAsyncGetStatus(block, false)
-}
 
 extern "system" fn purchase_ui_async(
     _: This,
@@ -368,15 +348,15 @@ static VTABLE: Methods<77> = Methods([
     missing::<31> as *const (),              // 0xf8
     missing::<32> as *const (),              // 0x100
     consumable_balance_async as *const (),   // 0x108
-    count_status as *const (),               // 0x110
+    status as *const (),                     // 0x110
     report_fulfillment_async as *const (),   // 0x118
-    count_status as *const (),               // 0x120
+    status as *const (),                     // 0x120
     user_id_async as *const (),              // 0x128 collections id
-    size_status as *const (),                // 0x130
-    string_status as *const (),              // 0x138
+    status as *const (),                     // 0x130
+    status as *const (),                     // 0x138
     user_id_async as *const (),              // 0x140 purchase id
-    size_status as *const (),                // 0x148
-    string_status as *const (),              // 0x150
+    status as *const (),                     // 0x148
+    status as *const (),                     // 0x150
     missing::<43> as *const (),              // 0x158 licence token
     missing::<44> as *const (),              // 0x160
     missing::<45> as *const (),              // 0x168
@@ -390,15 +370,15 @@ static VTABLE: Methods<77> = Methods([
     redeem_ui_async as *const (),            // 0x1a8
     status as *const (),                     // 0x1b0
     updates_async as *const (),              // 0x1b8
-    count_status as *const (),               // 0x1c0
-    array_status as *const (),               // 0x1c8
+    status as *const (),                     // 0x1c0
+    status as *const (),                     // 0x1c8
     missing::<58> as *const (),              // 0x1d0 download updates
     missing::<59> as *const (),              // 0x1d8
     install_async as *const (),              // 0x1e0 updates
     status as *const (),                     // 0x1e8
     install_async as *const (),              // 0x1f0 packages by store id
-    count_status as *const (),               // 0x1f8
-    array_status as *const (),               // 0x200
+    status as *const (),                     // 0x1f8
+    status as *const (),                     // 0x200
     package_identifier as *const (),         // 0x208
     register as *const (),                   // 0x210 game licence changed
     unregister as *const (),                 // 0x218
@@ -581,9 +561,9 @@ mod tests {
             S_OK
         );
         assert_eq!(xasync::XAsyncGetStatus(&mut b, true), NETWORK_ERROR);
-        type Count = extern "system" fn(This, *mut AsyncBlock, *mut u32) -> HRESULT;
+        type Status = extern "system" fn(This, *mut AsyncBlock) -> HRESULT;
         assert_eq!(
-            method::<Count>(&OBJECT, 0x1c0)(this, &mut b, &mut 0),
+            method::<Status>(&OBJECT, 0x1c0)(this, &mut b),
             NETWORK_ERROR
         );
 

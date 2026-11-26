@@ -8,9 +8,7 @@ use windows_sys::Wdk::System::Threading::{
     NtQueryInformationThread, ThreadBasicInformation, ThreadQuerySetWin32StartAddress,
 };
 use windows_sys::Win32::Foundation::{CloseHandle, HANDLE, INVALID_HANDLE_VALUE, LocalFree};
-use windows_sys::Win32::System::Diagnostics::Debug::{
-    CONTEXT, CONTEXT_FULL_AMD64, GetThreadContext,
-};
+use windows_sys::Win32::System::Diagnostics::Debug::{CONTEXT_FULL_AMD64, GetThreadContext};
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
     CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
 };
@@ -19,7 +17,7 @@ use windows_sys::Win32::System::Threading::{
     SuspendThread, THREAD_GET_CONTEXT, THREAD_QUERY_INFORMATION, THREAD_SUSPEND_RESUME,
 };
 
-use crate::crash::{MAX_FRAMES, locate, unwind_into};
+use crate::crash::{Aligned16, MAX_FRAMES, locate, unwind_into};
 
 /// Reads `VICTORY_STACKS` and, if set, starts a thread that prints every
 /// thread's stack at each listed time (seconds from now).
@@ -61,10 +59,6 @@ struct BasicInfo {
     priority: i32,
     base_priority: i32,
 }
-
-/// `GetThreadContext` wants a 16-byte aligned context.
-#[repr(C, align(16))]
-struct Aligned(CONTEXT);
 
 /// The ids of this process's threads but the caller's.
 pub(crate) fn other_threads() -> Vec<u32> {
@@ -165,7 +159,7 @@ pub(crate) fn frames_of(thread: HANDLE) -> (Vec<u64>, (i32, i32, usize)) {
     // holds the stack base at +8 and the stack limit at +0x10.
     let (high, low) = unsafe { (info.teb.add(1).read(), info.teb.add(2).read()) };
     // SAFETY: zeroed is a valid CONTEXT.
-    let mut context = Aligned(unsafe { std::mem::zeroed() });
+    let mut context = Aligned16(unsafe { std::mem::zeroed() });
     context.0.ContextFlags = CONTEXT_FULL_AMD64;
     // SAFETY: reads and resumes the thread suspended above; nothing until
     // the resume allocates or takes a lock the thread could hold besides

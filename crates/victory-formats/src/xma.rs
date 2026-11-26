@@ -632,10 +632,6 @@ impl Decoder {
         }
     }
 
-    pub fn channels(&self) -> usize {
-        self.channels
-    }
-
     /// Forgets the overlap with earlier frames (a new stream or a seek).
     pub fn reset(&mut self) {
         self.ch = [Channel::new(), Channel::new()];
