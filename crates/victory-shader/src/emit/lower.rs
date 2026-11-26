@@ -380,6 +380,18 @@ struct Lower<'a> {
     balloting: HashSet<Value>,
     /// Block writing each value.
     def_block: HashMap<Value, usize>,
+    /// What reads each value, found once for the lookups every descriptor
+    /// load makes ([`Lower::read_as_number`], [`Lower::computed_with`],
+    /// [`Lower::sized_view`], [`Lower::unused_descriptor_kind`]), which
+    /// scanned the whole program each time (it does not change while it is
+    /// lowered). Built after [`SCANS_BEFORE_READERS`] of those scans.
+    readers: std::cell::OnceCell<Readers>,
+    /// The scans made while `readers` is not built.
+    scans: std::cell::Cell<u32>,
+    /// The loaded sources among the descriptors' leaves, found once for the
+    /// same reason: the descriptor's role and site, the load, the load's
+    /// first dword.
+    loaded_leaves: std::cell::OnceCell<Vec<(Role, Site, Site, u8)>>,
     /// IR block being lowered.
     cur_ir: usize,
     /// Whole-wave sections by block and start index.
@@ -404,6 +416,20 @@ struct Lower<'a> {
 /// program as killed (a pixel discards).
 // shortcut: a genuine loop of more iterations than this is cut short too.
 pub(super) const LOOP_LIMIT: u32 = 1 << 20;
+
+/// Whole-program scans for the readers of a value before [`Readers`] are
+/// listed: building the list costs a few dozen scans, so a program with few
+/// descriptor loads keeps scanning.
+const SCANS_BEFORE_READERS: u32 = 32;
+
+/// The instructions and phis reading each value (see [`Lower::readers_of`]).
+#[derive(Default)]
+struct Readers {
+    /// The instructions reading each value, in program order.
+    insts: HashMap<Value, Vec<Site>>,
+    /// The values phis read.
+    phis: HashSet<Value>,
+}
 
 /// Lane masks read as numbers (`s_bcnt1`, `s_ff1`, `v_mbcnt`, scalar
 /// compares, bit tests) are ballots of the lanes' booleans, taken where the
@@ -2141,6 +2167,9 @@ impl<'a> Lower<'a> {
                         .chain(block.phis.iter().map(move |phi| (phi.value, b)))
                 })
                 .collect(),
+            readers: Default::default(),
+            scans: Default::default(),
+            loaded_leaves: Default::default(),
             cur_ir: 0,
             sections: HashMap::new(),
             section_out: HashSet::new(),
@@ -3315,12 +3344,82 @@ impl<'a> Lower<'a> {
     /// Whether some instruction reads `v` as a number (or may, through a
     /// join), rather than in a descriptor operand.
     fn read_as_number(&self, v: Value) -> bool {
-        self.x.p.blocks.iter().any(|b| {
-            b.phis.iter().any(|p| p.args.contains(&v))
-                || b.insts.iter().any(|i| {
-                    matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_))
-                        && i.reads.iter().any(|r| r.1 == v)
-                })
+        self.read_by_phi(v)
+            || self
+                .readers_of(v)
+                .any(|i| matches!(i.fields, Fields::Sop { .. } | Fields::Valu(_)))
+    }
+
+    /// The instructions reading `v`, in program order.
+    fn readers_of(&self, v: Value) -> impl Iterator<Item = &'a Inst> + '_ {
+        let p = self.x.p;
+        let (listed, scanned) = match self.readers() {
+            Some(r) => (r.insts.get(&v), None),
+            None => {
+                let insts = p.blocks.iter().flat_map(|b| &b.insts);
+                let reads = move |i: &&Inst| i.reads.iter().any(|r| r.1 == v);
+                (None, Some(insts.filter(reads)))
+            }
+        };
+        listed
+            .into_iter()
+            .flatten()
+            .map(move |&(b, i)| &p.blocks[b].insts[i])
+            .chain(scanned.into_iter().flatten())
+    }
+
+    /// Whether a phi reads `v`.
+    fn read_by_phi(&self, v: Value) -> bool {
+        match self.readers() {
+            Some(r) => r.phis.contains(&v),
+            None => {
+                let mut phis = self.x.p.blocks.iter().flat_map(|b| &b.phis);
+                phis.any(|phi| phi.args.contains(&v))
+            }
+        }
+    }
+
+    /// [`Readers`], once the program has been scanned
+    /// [`SCANS_BEFORE_READERS`] times; until then the caller scans it.
+    fn readers(&self) -> Option<&Readers> {
+        if self.readers.get().is_none() {
+            let scans = self.scans.get() + 1;
+            self.scans.set(scans);
+            if scans <= SCANS_BEFORE_READERS {
+                return None;
+            }
+        }
+        Some(self.readers.get_or_init(|| {
+            let mut r = Readers::default();
+            for (b, block) in self.x.p.blocks.iter().enumerate() {
+                for phi in &block.phis {
+                    r.phis.extend(phi.args.iter().copied());
+                }
+                for (i, inst) in block.insts.iter().enumerate() {
+                    for read in &inst.reads {
+                        let at = r.insts.entry(read.1).or_default();
+                        if at.last() != Some(&(b, i)) {
+                            at.push((b, i));
+                        }
+                    }
+                }
+            }
+            r
+        }))
+    }
+
+    /// The loaded sources among every descriptor's leaves, in order.
+    fn loaded_leaves(&self) -> &[(Role, Site, Site, u8)] {
+        self.loaded_leaves.get_or_init(|| {
+            let mut loaded = Vec::new();
+            for d in &self.x.res.descriptors {
+                for l in d.source.leaves() {
+                    if let Source::Loaded { load, first } = *l {
+                        loaded.push((d.role, d.site, load, first));
+                    }
+                }
+            }
+            loaded
         })
     }
 
@@ -3330,10 +3429,7 @@ impl<'a> Lower<'a> {
     /// waterfall loop keeps a descriptor's dwords per lane, reads the first
     /// lane's back and compares the lanes' with them.
     fn computed_with(&self, v: Value, depth: u32) -> bool {
-        self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
-            if !i.reads.iter().any(|r| r.1 == v) {
-                return false;
-            }
+        self.readers_of(v).any(|i| {
             let name = i.name();
             let moves = matches!(
                 name,
@@ -3427,12 +3523,7 @@ impl<'a> Lower<'a> {
     ///   the record count, nothing else.
     fn sized_view(&self, inst: &Inst, site: Site, code: u8, count: u32) -> Option<bool> {
         let dword = |k: u8| inst.write(Reg::S(code + k));
-        let read = |v: Value| {
-            self.x.p.blocks.iter().any(|b| {
-                b.insts.iter().any(|i| i.reads.iter().any(|r| r.1 == v))
-                    || b.phis.iter().any(|p| p.args.contains(&v))
-            })
-        };
+        let read = |v: Value| self.readers_of(v).next().is_some() || self.read_by_phi(v);
         let only = |allowed: &[u8]| {
             (0..count as u8).all(|k| allowed.contains(&k) || !dword(k).is_some_and(read))
         };
@@ -3440,9 +3531,8 @@ impl<'a> Lower<'a> {
             8 => {
                 const HEIGHT: u32 = 16 << 16 | 14;
                 let v = dword(2)?;
-                let height = self.x.p.blocks.iter().flat_map(|b| &b.insts).any(|i| {
+                let height = self.readers_of(v).any(|i| {
                     i.name() == "s_bfe_u32"
-                        && i.reads.iter().any(|r| r.1 == v)
                         && matches!(&i.fields, Fields::Sop { src, .. }
                             if matches!(src.get(1), Some(Operand::Literal(HEIGHT))))
                 });
@@ -6961,17 +7051,13 @@ impl<'a> Lower<'a> {
         // How the program uses the descriptor tells the view's kind: an image or buffer
         // instruction before a scalar buffer load, which reads any buffer.
         let x = self.x;
+        // Each descriptor's leaves in order, so the first use found is the same.
+        let leaves = self.loaded_leaves();
         let uses = |of: Site| {
-            x.res
-                .descriptors
+            leaves
                 .iter()
-                .filter(|d| d.role == Role::Resource)
-                .filter_map(move |d| {
-                    d.source.leaves().into_iter().find_map(|l| match *l {
-                        Source::Loaded { load, first } if load == of => Some((d.site, first)),
-                        _ => None,
-                    })
-                })
+                .filter(move |l| l.0 == Role::Resource && l.2 == of)
+                .map(|l| (l.1, l.3))
         };
         let by_scalar_load = |u: &(Site, u8)| {
             matches!(x.p.blocks[u.0.0].insts[u.0.1].fields, Fields::Smem { .. })
@@ -7032,12 +7118,7 @@ impl<'a> Lower<'a> {
             // A sampler's descriptor: no program reads its dwords as numbers, so where one
             // meets numbers at a join the register is dead on that path (`dead`), as a
             // descriptor's address or format is.
-            let sampler = x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            });
+            let sampler = self.loaded_leaves().iter().any(|l| l.0 == Role::Sampler && l.2 == site);
             if sampler {
                 self.stale.extend(inst.writes.iter().map(|w| w.1));
                 return Err("a sampler's descriptor read as data");
@@ -7287,12 +7368,10 @@ impl<'a> Lower<'a> {
         // Kept per lane and compared (`Resources::lane_copied`), or a sampler's: the cases
         // `descriptor_data` handles on their own.
         if self.x.res.lane_copied.contains(&site)
-            || self.x.res.descriptors.iter().any(|d| {
-                d.role == Role::Sampler
-                    && d.source.leaves().into_iter().any(
-                        |l| matches!(*l, Source::Loaded { load, .. } if load == site),
-                    )
-            })
+            || self
+                .loaded_leaves()
+                .iter()
+                .any(|l| l.0 == Role::Sampler && l.2 == site)
         {
             return None;
         }
@@ -7304,14 +7383,8 @@ impl<'a> Lower<'a> {
             return None;
         }
         let read = |k: u32| {
-            inst.write(Reg::S(code + k as u8)).is_some_and(|v| {
-                self.x
-                    .p
-                    .blocks
-                    .iter()
-                    .flat_map(|b| &b.insts)
-                    .any(|i| i.reads.iter().any(|r| r.1 == v))
-            })
+            inst.write(Reg::S(code + k as u8))
+                .is_some_and(|v| self.readers_of(v).next().is_some())
         };
         let uav = used.is_some_and(|u| u.kind == ResourceType::Uav);
         let u = if uav { 0x1000 } else { 0 };
