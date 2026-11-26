@@ -132,6 +132,9 @@ pub struct Connection {
 
 struct State {
     streams: Vec<Option<OpusDecoder>>,
+    /// Room for the longest stereo packet, reused by every decode (they all run
+    /// under this lock).
+    scratch: Vec<f32>,
     /// Results not yet dequeued, per stream.
     queued: Vec<u32>,
     results: VecDeque<ApuResult>,
@@ -206,6 +209,7 @@ pub extern "system" fn XApuConnect(
         per_stream: input.commands_per_stream,
         state: Mutex::new(State {
             streams: (0..streams).map(|_| None).collect(),
+            scratch: vec![0f32; MAX_FRAMES * 2],
             queued: vec![0; streams],
             results: VecDeque::new(),
             commands: 0,
@@ -249,6 +253,8 @@ pub extern "system" fn XApuEnqueueCommand(
     // SAFETY: a connection from `XApuConnect`; every command starts with an id.
     let (connection, id) = unsafe { (&*handle, command.read_unaligned()) };
     let mut state = lock(connection);
+    // Borrowed once so the decoder and the scratch are separate fields.
+    let state = &mut *state;
     let stream = id.stream as usize;
     if stream >= state.streams.len() {
         return INVALID_STREAM;
@@ -300,7 +306,13 @@ pub extern "system" fn XApuEnqueueCommand(
             // SAFETY: a process command is this struct.
             let command = unsafe { command.cast::<Process>().read_unaligned() };
             match decoder {
-                Some(d) => process(d, connection.options, &command, &mut result),
+                Some(d) => process(
+                    d,
+                    &mut state.scratch,
+                    connection.options,
+                    &command,
+                    &mut result,
+                ),
                 None => result.error = INVALID_STREAM,
             }
         }
@@ -322,7 +334,13 @@ pub extern "system" fn XApuEnqueueCommand(
 
 /// Decodes one packet into the command's output buffer, keeping the frames
 /// from `first_frame` on, at most `frame_count` of them.
-fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &mut ApuResult) {
+fn process(
+    decoder: &mut OpusDecoder,
+    scratch: &mut [f32],
+    options: u32,
+    command: &Process,
+    result: &mut ApuResult,
+) {
     let channels = decoder.channels();
     let (input, input_length) = (command.input, command.input_length);
     let (output, output_length) = (command.output, command.output_length);
@@ -335,8 +353,13 @@ fn process(decoder: &mut OpusDecoder, options: u32, command: &Process, result: &
     }
     // SAFETY: the title's packet in its connection memory.
     let packet = unsafe { std::slice::from_raw_parts(input, input_length as usize) };
-    let mut pcm = vec![0f32; MAX_FRAMES * channels];
-    let decoded = match decoder.decode(packet, MAX_FRAMES, &mut pcm) {
+    // The decoder adds to parts of its output and leaves the rest as it was, so
+    // the packet's span starts at zero as a new buffer would; nothing past it is
+    // read or kept.
+    let span = opus_pure::packet::samples(packet, decoder.sample_rate()).unwrap_or(MAX_FRAMES);
+    let pcm = &mut scratch[..MAX_FRAMES * channels];
+    pcm[..span * channels].fill(0.0);
+    let decoded = match decoder.decode(packet, MAX_FRAMES, pcm) {
         Ok(n) => n,
         Err(_) => {
             result.error = BAD_PACKET;
@@ -427,6 +450,64 @@ mod tests {
             sequence: 7,
             options: 0,
             context: 0x1234,
+        }
+    }
+
+    #[test]
+    fn a_reused_scratch_decodes_as_a_new_buffer_does() {
+        let tone: Vec<f32> = (0..2880 * 2)
+            .map(|i| (i as f32 * 0.01).sin() * 0.5)
+            .collect();
+        let mut encoder = OpusEncoder::new(48_000, 2, Application::Audio).unwrap();
+        let mut scratch = vec![0f32; MAX_FRAMES * 2];
+        let mut reused = OpusDecoder::new(48_000, 2).unwrap();
+        let mut fresh = OpusDecoder::new(48_000, 2).unwrap();
+        // The longest packet first, so each shorter one meets what it left.
+        for frames in [2880, 960, 480, 960] {
+            let mut packet = [0u8; 1500];
+            let n = encoder
+                .encode(&tone[..frames * 2], frames, &mut packet)
+                .unwrap();
+            let mut out = vec![0f32; frames * 2];
+            let command = Process {
+                id: id(PROCESS, 0),
+                pitch_ramp: 0.0,
+                target_pitch: 1.0,
+                first_frame: 0,
+                frame_count: frames as u32,
+                input_length: n as u32,
+                input: packet.as_ptr(),
+                output_length: (frames * 8) as u32,
+                output: out.as_mut_ptr().cast(),
+            };
+            let mut result = std::mem::MaybeUninit::<ApuResult>::zeroed();
+            // SAFETY: all zero is a valid result, and `process` fills it in.
+            let result = unsafe {
+                process(
+                    &mut reused,
+                    &mut scratch,
+                    0,
+                    &command,
+                    result.assume_init_mut(),
+                );
+                result.assume_init()
+            };
+            let (error, decoded) = (result.error, result.frames);
+            assert_eq!((error, decoded), (S_OK, frames as u32));
+
+            let mut expected = vec![0f32; MAX_FRAMES * 2];
+            assert_eq!(
+                fresh
+                    .decode(&packet[..n], MAX_FRAMES, &mut expected)
+                    .unwrap(),
+                frames
+            );
+            assert!(
+                out.iter()
+                    .zip(&expected)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{frames} frames differ"
+            );
         }
     }
 
